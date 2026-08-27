@@ -20,12 +20,17 @@ enum ThermalSpec {
 // MARK: - History retention (rrdtool-style multi-resolution)
 //
 // Last 5 minutes stay at full 1s resolution ("current"); everything older,
-// back to 3 hours total, is consolidated into 5-minute averages so the
-// chart can span hours without keeping tens of thousands of raw samples.
+// back to 24 hours total, is consolidated into 5-minute averages so the
+// chart can span a full day without keeping hundreds of thousands of raw
+// samples.
 enum HistorySpec {
     static let rawCapacitySeconds = 300      // 5 minutes @ 1s
     static let bucketSeconds: Double = 300   // each bucket averages 5 minutes
-    static let bucketCapacity = 35           // 35 * 5min = 175 minutes behind the raw window (+5 min raw = 3h)
+    static let bucketCapacity = 287          // 287 * 5min = 1435 minutes behind the raw window (+5 min raw = 1440min = 24h)
+
+    static var totalHours: Double {
+        (Double(bucketCapacity) * bucketSeconds + Double(rawCapacitySeconds)) / 3600
+    }
 }
 
 // MARK: - Alerts
@@ -430,6 +435,23 @@ struct ContentView: View {
         return .green
     }
 
+    private var historyAverage: Double {
+        guard !reader.bucketHistory.isEmpty else { return 0 }
+        return reader.bucketHistory.reduce(0, +) / Double(reader.bucketHistory.count)
+    }
+
+    private var historyColor: Color {
+        if historyAverage >= ThermalSpec.red { return .red }
+        if historyAverage >= ThermalSpec.yellow { return .yellow }
+        return .green
+    }
+
+    private var historyLabel: String {
+        let hours = HistorySpec.totalHours
+        let hoursText = hours.truncatingRemainder(dividingBy: 1) == 0 ? String(Int(hours)) : String(format: "%.1f", hours)
+        return "History — last \(hoursText)h, 5-min avg"
+    }
+
     var body: some View {
         VStack(spacing: 8) {
             HStack {
@@ -459,7 +481,16 @@ struct ContentView: View {
             TimeAxisLabels(totalSeconds: Double(reader.rawHistory.count))
                 .padding(.horizontal)
 
-            paneLabel("History — last 3h, 5-min avg")
+            HStack {
+                Text(historyLabel)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(historyAverage > 0 ? String(format: "avg %.1f°C", historyAverage) : "avg —")
+                    .foregroundColor(historyColor)
+            }
+            .font(.caption.bold())
+            .padding(.horizontal)
+
             TemperatureChart(values: reader.bucketHistory, emptyMessage: "Collecting data — first 5-min average lands soon")
                 .frame(height: 110)
                 .padding(.horizontal)
