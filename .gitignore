@@ -1,0 +1,4 @@
+TempMonitor
+TempMonitor.app/
+*.dSYM/
+.DS_Store
