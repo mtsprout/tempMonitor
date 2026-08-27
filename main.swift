@@ -17,6 +17,17 @@ enum ThermalSpec {
     static let chartCeiling: Double = tjMax + 5.0
 }
 
+// MARK: - History retention (rrdtool-style multi-resolution)
+//
+// Last 5 minutes stay at full 1s resolution ("current"); everything older,
+// back to 3 hours total, is consolidated into 5-minute averages so the
+// chart can span hours without keeping tens of thousands of raw samples.
+enum HistorySpec {
+    static let rawCapacitySeconds = 300      // 5 minutes @ 1s
+    static let bucketSeconds: Double = 300   // each bucket averages 5 minutes
+    static let bucketCapacity = 35           // 35 * 5min = 175 minutes behind the raw window (+5 min raw = 3h)
+}
+
 // MARK: - Alerts
 
 enum AlertLevel: Equatable {
@@ -33,7 +44,8 @@ final class TemperatureReader: ObservableObject {
     // even while the window is hidden.
     static let shared = TemperatureReader()
 
-    @Published var history: [Double] = []
+    @Published var rawHistory: [Double] = []      // last 5 minutes, full resolution
+    @Published var bucketHistory: [Double] = []   // older, 5-minute averages, oldest first
     @Published var current: Double = 0
     @Published var maxSeen: Double = 0
     @Published var alertLevel: AlertLevel = .none
@@ -42,8 +54,12 @@ final class TemperatureReader: ObservableObject {
     var onSample: ((Double, [Double]) -> Void)?
 
     private var timer: Timer?
-    private let capacity = 180 // 3 minutes at 1s resolution
     private let toolPath = "/usr/local/bin/osx-cpu-temp"
+
+    // Accumulates raw samples evicted from rawHistory until there are
+    // enough (5 minutes' worth) to consolidate into one bucket average.
+    private var bucketSum = 0.0
+    private var bucketCount = 0
 
     // Edge-triggered alert state: fires once per breach, resets once the
     // temperature drops a few degrees below the yellow line (hysteresis)
@@ -66,12 +82,28 @@ final class TemperatureReader: ObservableObject {
         DispatchQueue.main.async {
             self.current = value
             self.maxSeen = max(self.maxSeen, value)
-            self.history.append(value)
-            if self.history.count > self.capacity {
-                self.history.removeFirst(self.history.count - self.capacity)
+
+            self.rawHistory.append(value)
+            if self.rawHistory.count > HistorySpec.rawCapacitySeconds {
+                // The sample aging out of the raw window feeds the
+                // in-progress bucket — never the newly-arrived one, so
+                // buckets only ever cover time strictly older than the
+                // raw window (no overlap/double-counting).
+                let evicted = self.rawHistory.removeFirst()
+                self.bucketSum += evicted
+                self.bucketCount += 1
+                if self.bucketCount >= Int(HistorySpec.bucketSeconds) {
+                    self.bucketHistory.append(self.bucketSum / HistorySpec.bucketSeconds)
+                    if self.bucketHistory.count > HistorySpec.bucketCapacity {
+                        self.bucketHistory.removeFirst()
+                    }
+                    self.bucketSum = 0
+                    self.bucketCount = 0
+                }
             }
+
             self.checkThresholds(value)
-            self.onSample?(value, self.history)
+            self.onSample?(value, self.rawHistory)
         }
     }
 
@@ -160,10 +192,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.action = #selector(statusItemClicked)
         item.button?.target = self
         statusItem = item
-        updateIcon(value: 0, history: [])
+        updateIcon(current: 0, average: 0)
 
         TemperatureReader.shared.onSample = { [weak self] value, history in
-            self?.updateIcon(value: value, history: history)
+            // Drive the icon off the rolling 5-minute average rather than
+            // the raw per-second value: the raw reading jitters constantly
+            // and would make the menu bar icon distractingly noisy.
+            let average = history.isEmpty ? value : history.reduce(0, +) / Double(history.count)
+            self?.updateIcon(current: value, average: average)
         }
         TemperatureReader.shared.start()
     }
@@ -191,54 +227,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         (mainWindow ?? NSApp.windows.first)?.makeKeyAndOrderFront(nil)
     }
 
-    private func updateIcon(value: Double, history: [Double]) {
-        let color: NSColor
-        if value >= ThermalSpec.red {
-            color = .systemRed
-        } else if value >= ThermalSpec.yellow {
-            color = .systemYellow
+    // Renders a small thermometer glyph (tube + bulb, mercury filled to
+    // the current level) plus the 5-minute average as text, all as one
+    // hand-drawn image — matching the app's existing lockFocus-based icon
+    // rendering rather than relying on SF Symbol availability/versioning.
+    private func updateIcon(current: Double, average: Double) {
+        let mercuryColor: NSColor
+        if average >= ThermalSpec.red {
+            mercuryColor = .systemRed
+        } else if average >= ThermalSpec.yellow {
+            mercuryColor = .systemYellow
         } else {
-            color = .systemGreen
+            mercuryColor = .systemGreen
         }
 
-        let size = NSSize(width: 28, height: 18)
+        // Non-template image (so severity color survives), so pick an ink
+        // color by hand that matches the menu bar's current light/dark
+        // appearance instead of relying on the OS to invert it for us.
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let inkColor: NSColor = isDark ? .white : .black
+
+        let displayText = average > 0 ? String(format: "%.0f°", average) : "--"
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: inkColor]
+        let textSize = displayText.size(withAttributes: attributes)
+
+        let iconHeight: CGFloat = 18
+        let bulbDiameter: CGFloat = 8
+        let tubeWidth: CGFloat = 3.4
+        let bulbCenterX = bulbDiameter / 2 + 1
+        let tubeBottom = bulbDiameter / 2 // tube visually merges into the bulb
+        let tubeTop = iconHeight - 1
+        let tubeHeight = tubeTop - tubeBottom
+        let tubeRect = NSRect(x: bulbCenterX - tubeWidth / 2, y: tubeBottom, width: tubeWidth, height: tubeHeight)
+        let bulbRect = NSRect(x: bulbCenterX - bulbDiameter / 2, y: 0, width: bulbDiameter, height: bulbDiameter)
+
+        let size = NSSize(width: bulbDiameter + 6 + textSize.width, height: iconHeight)
         let image = NSImage(size: size)
         image.lockFocus()
 
-        let recent = Array(history.suffix(28))
-        if recent.count > 1 {
-            let minV = ThermalSpec.chartFloor
-            let maxV = ThermalSpec.chartCeiling
-            let stepX = size.width / CGFloat(max(recent.count - 1, 1))
-            let path = NSBezierPath()
-            path.lineWidth = 1.6
-            path.lineJoinStyle = .round
-            path.lineCapStyle = .round
-            for (index, sample) in recent.enumerated() {
-                let clamped = min(max(sample, minV), maxV)
-                let fraction = (clamped - minV) / (maxV - minV)
-                let point = NSPoint(x: CGFloat(index) * stepX, y: 1 + CGFloat(fraction) * (size.height - 2))
-                if index == 0 {
-                    path.move(to: point)
-                } else {
-                    path.line(to: point)
-                }
-            }
-            color.setStroke()
-            path.stroke()
+        let tubePath = NSBezierPath(roundedRect: tubeRect, xRadius: tubeWidth / 2, yRadius: tubeWidth / 2)
+        inkColor.withAlphaComponent(0.6).setStroke()
+        tubePath.lineWidth = 1
+        tubePath.stroke()
+
+        let fraction = min(max((average - ThermalSpec.chartFloor) / (ThermalSpec.chartCeiling - ThermalSpec.chartFloor), 0), 1)
+        let fillHeight = tubeHeight * CGFloat(fraction)
+        if fillHeight > 0 {
+            NSGraphicsContext.saveGraphicsState()
+            tubePath.addClip()
+            mercuryColor.setFill()
+            NSBezierPath(rect: NSRect(x: tubeRect.minX, y: tubeRect.minY, width: tubeRect.width, height: fillHeight)).fill()
+            NSGraphicsContext.restoreGraphicsState()
         }
+
+        let bulbPath = NSBezierPath(ovalIn: bulbRect)
+        mercuryColor.setFill()
+        bulbPath.fill()
+        inkColor.withAlphaComponent(0.6).setStroke()
+        bulbPath.lineWidth = 1
+        bulbPath.stroke()
+
+        displayText.draw(at: NSPoint(x: bulbDiameter + 6, y: (iconHeight - textSize.height) / 2), withAttributes: attributes)
 
         image.unlockFocus()
         image.isTemplate = false
         statusItem.button?.image = image
-        statusItem.button?.toolTip = value > 0 ? String(format: "%.1f°C", value) : nil
+        // Hover still shows the live instantaneous reading, distinct from
+        // the smoothed average the icon itself displays.
+        statusItem.button?.toolTip = current > 0 ? String(format: "%.1f°C", current) : nil
     }
 }
 
 // MARK: - Chart
 
 struct TemperatureChart: View {
-    let history: [Double]
+    let values: [Double]
+    var emptyMessage: String? = nil
 
     private func y(for value: Double, height: CGFloat) -> CGFloat {
         let clamped = min(max(value, ThermalSpec.chartFloor), ThermalSpec.chartCeiling)
@@ -270,16 +336,26 @@ struct TemperatureChart: View {
                 }
                 .stroke(Color.gray.opacity(0.15), lineWidth: 1)
 
+                // Vertical gridlines at the same time fractions as the x-axis labels below
+                Path { path in
+                    for fraction in [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0] {
+                        let px = CGFloat(fraction) * width
+                        path.move(to: CGPoint(x: px, y: 0))
+                        path.addLine(to: CGPoint(x: px, y: height))
+                    }
+                }
+                .stroke(Color.gray.opacity(0.15), lineWidth: 1)
+
                 // Yellow threshold (85%)
                 thresholdLine(value: ThermalSpec.yellow, color: .yellow, width: width, height: height)
                 // Red threshold (95%)
                 thresholdLine(value: ThermalSpec.red, color: .red, width: width, height: height)
 
                 // Temperature line, colored by current severity
-                if history.count > 1 {
+                if values.count > 1 {
                     Path { path in
-                        let stepX = width / CGFloat(max(history.count - 1, 1))
-                        for (index, value) in history.enumerated() {
+                        let stepX = width / CGFloat(max(values.count - 1, 1))
+                        for (index, value) in values.enumerated() {
                             let point = CGPoint(x: CGFloat(index) * stepX, y: y(for: value, height: height))
                             if index == 0 {
                                 path.move(to: point)
@@ -288,7 +364,11 @@ struct TemperatureChart: View {
                             }
                         }
                     }
-                    .stroke(lineColor(for: history.last ?? 0), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    .stroke(lineColor(for: values.last ?? 0), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                } else if let message = emptyMessage {
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
             }
         }
@@ -309,6 +389,33 @@ struct TemperatureChart: View {
                 .padding(.leading, 4)
                 .offset(y: py - 12)
         }
+    }
+}
+
+// X-axis: elapsed time behind "now", derived from the total seconds a
+// pane's data spans (sample count * seconds-per-sample) rather than
+// wall-clock timestamps.
+struct TimeAxisLabels: View {
+    let totalSeconds: Double
+
+    private func label(atFraction fraction: Double) -> String {
+        guard totalSeconds > 1 else { return "" }
+        let ageSeconds = Int((totalSeconds * (1 - fraction)).rounded())
+        if ageSeconds <= 0 { return "now" }
+        if ageSeconds < 60 { return "-\(ageSeconds)s" }
+        if ageSeconds < 3600 { return "-\(ageSeconds / 60)m" }
+        return String(format: "-%.1fh", Double(ageSeconds) / 3600.0)
+    }
+
+    var body: some View {
+        HStack {
+            Text(label(atFraction: 0)).frame(maxWidth: .infinity, alignment: .leading)
+            Text(label(atFraction: 1.0 / 3.0)).frame(maxWidth: .infinity, alignment: .center)
+            Text(label(atFraction: 2.0 / 3.0)).frame(maxWidth: .infinity, alignment: .center)
+            Text(label(atFraction: 1)).frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .font(.system(size: 9))
+        .foregroundColor(.secondary)
     }
 }
 
@@ -345,7 +452,18 @@ struct ContentView: View {
             }
             .padding([.top, .horizontal])
 
-            TemperatureChart(history: reader.history)
+            paneLabel("Live — last 5 min")
+            TemperatureChart(values: reader.rawHistory)
+                .frame(height: 110)
+                .padding(.horizontal)
+            TimeAxisLabels(totalSeconds: Double(reader.rawHistory.count))
+                .padding(.horizontal)
+
+            paneLabel("History — last 3h, 5-min avg")
+            TemperatureChart(values: reader.bucketHistory, emptyMessage: "Collecting data — first 5-min average lands soon")
+                .frame(height: 110)
+                .padding(.horizontal)
+            TimeAxisLabels(totalSeconds: Double(reader.bucketHistory.count) * HistorySpec.bucketSeconds)
                 .padding(.horizontal)
                 .padding(.bottom)
 
@@ -363,7 +481,7 @@ struct ContentView: View {
             .padding([.horizontal, .bottom])
             .font(.caption2)
         }
-        .frame(minWidth: 320, idealWidth: 400, minHeight: 320, idealHeight: 400)
+        .frame(minWidth: 320, idealWidth: 420, minHeight: 480, idealHeight: 600)
         .background(WindowAccessor { window in
             AppDelegate.shared.attach(window: window)
         })
@@ -381,6 +499,14 @@ struct ContentView: View {
         .foregroundColor(.white)
         .background((critical ? Color.red : Color.yellow.opacity(0.9)))
         .cornerRadius(6)
+    }
+
+    private func paneLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.caption.bold())
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal)
     }
 
     private func legendDot(color: Color, label: String) -> some View {

@@ -4,7 +4,7 @@ A small native macOS app that graphs CPU temperature live, like Activity Monitor
 
 ## Features
 
-- Scrolling line graph of the last 3 minutes of CPU temperature readings
+- Scrolling line graph spanning the last 3 hours, rrdtool-style: the most recent 5 minutes at full 1-second resolution, consolidated into 5-minute averages beyond that — full detail on "now," a long trend without keeping tens of thousands of raw points
 - Dashed **yellow line at 85°C** and **red line at 95°C** — 85% and 95% of this Mac's CPU thermal max (see below)
 - Line color shifts green → yellow → red live based on the current reading
 - Menu bar icon with a live mini sparkline, colored the same way; hover shows the current temperature; click brings the window to the front
