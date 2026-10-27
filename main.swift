@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import AppKit
 import UserNotifications
+import SQLite3
 
 // MARK: - Thermal spec
 //
@@ -19,17 +20,169 @@ enum ThermalSpec {
 
 // MARK: - History retention (rrdtool-style multi-resolution)
 //
-// Last 5 minutes stay at full 1s resolution ("current"); everything older,
-// back to 24 hours total, is consolidated into 5-minute averages so the
-// chart can span a full day without keeping hundreds of thousands of raw
-// samples.
+// Last 5 minutes stay at full 1s resolution ("current"); the raw sample
+// evicted from that window feeds a running accumulator that finalizes into
+// one 5-minute average every bucketSeconds, which is what gets written
+// through to HistoryStore (see below) for everything older.
 enum HistorySpec {
     static let rawCapacitySeconds = 300      // 5 minutes @ 1s
     static let bucketSeconds: Double = 300   // each bucket averages 5 minutes
-    static let bucketCapacity = 287          // 287 * 5min = 1435 minutes behind the raw window (+5 min raw = 1440min = 24h)
+}
 
-    static var totalHours: Double {
-        (Double(bucketCapacity) * bucketSeconds + Double(rawCapacitySeconds)) / 3600
+// MARK: - Selectable range (SQLite-backed, beyond the 5-minute Live window)
+//
+// The Range pane queries HistoryStore live for whichever of these is
+// selected. Granularity is chosen per range so the point count stays
+// reasonable: the three shortest ranges use the native 5-minute bucket
+// resolution as-is (no further rollup); the longer ones roll up to hourly
+// or daily averages.
+enum RangeSpec {
+    static let retentionSeconds: Int64 = 365 * 24 * 3600 // 1 year
+
+    enum Range: String, CaseIterable, Identifiable {
+        case hour1 = "1 Hour"
+        case hours12 = "12 Hours"
+        case hours24 = "24 Hours"
+        case week1 = "1 Week"
+        case days30 = "30 Days"
+        case year1 = "1 Year"
+
+        var id: String { rawValue }
+
+        var windowSeconds: Int64 {
+            switch self {
+            case .hour1: return 3600
+            case .hours12: return 12 * 3600
+            case .hours24: return 24 * 3600
+            case .week1: return 7 * 24 * 3600
+            case .days30: return 30 * 24 * 3600
+            case .year1: return RangeSpec.retentionSeconds
+            }
+        }
+
+        var granularitySeconds: Int64 {
+            switch self {
+            case .hour1, .hours12, .hours24: return Int64(HistorySpec.bucketSeconds) // ~12/144/288 points
+            case .week1, .days30: return 3600                                        // hourly, ~168/720 points
+            case .year1: return 86400                                                // daily, ~365 points
+            }
+        }
+
+        var granularityLabel: String {
+            switch self {
+            case .hour1, .hours12, .hours24: return "5-min avg"
+            case .week1, .days30: return "hourly avg"
+            case .year1: return "daily avg"
+            }
+        }
+    }
+}
+
+// MARK: - Durable history store (SQLite)
+//
+// Persists finalized 5-minute bucket averages to disk so history survives
+// app restarts/crashes, and serves the rollup queries behind the Range
+// pane's six selectable windows (1 Hour through 1 Year). This is the sole
+// source of truth for anything beyond the last 5 minutes — the in-memory
+// rawHistory in TemperatureReader only ever covers the Live pane.
+//
+// Uses macOS's built-in SQLite3 (import SQLite3 above) — this autolinks via
+// the SDK's module map under plain swiftc, no -lsqlite3 or other build flag
+// needed. INTEGER PRIMARY KEY makes `timestamp` the table's rowid, so every
+// access pattern here (recent-N, prune-older-than, range+group) is a plain
+// range scan with no separate index required.
+final class HistoryStore {
+    static let shared = HistoryStore()
+
+    private var db: OpaquePointer?
+
+    private init() {
+        let fm = FileManager.default
+        let supportDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TempMonitor", isDirectory: true)
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let dbPath = supportDir.appendingPathComponent("history.sqlite").path
+
+        if sqlite3_open(dbPath, &db) != SQLITE_OK {
+            NSLog("HistoryStore: failed to open \(dbPath) — long-range history will be unavailable this run.")
+            db = nil
+            return
+        }
+        exec("PRAGMA journal_mode=WAL;")
+        exec("PRAGMA synchronous=NORMAL;")
+        exec("""
+            CREATE TABLE IF NOT EXISTS bucket_samples (
+                timestamp   INTEGER PRIMARY KEY,
+                temperature REAL NOT NULL
+            );
+            """)
+    }
+
+    private func exec(_ sql: String) {
+        guard let db else { return }
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            NSLog("HistoryStore: exec failed (\(String(cString: sqlite3_errmsg(db)))): \(sql)")
+        }
+    }
+
+    // Idempotent write of one finalized 5-minute bucket.
+    func insertBucket(timestamp: Int64, temperature: Double) {
+        guard let db else { return }
+        let sql = "INSERT OR REPLACE INTO bucket_samples (timestamp, temperature) VALUES (?, ?);"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, timestamp)
+        sqlite3_bind_double(stmt, 2, temperature)
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            NSLog("HistoryStore: insert failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+    }
+
+    // Drops rows older than the retention window. Cheap: PK-ordered range delete.
+    func pruneOlderThan(_ cutoff: Int64) {
+        guard let db else { return }
+        let sql = "DELETE FROM bucket_samples WHERE timestamp < ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, cutoff)
+        sqlite3_step(stmt)
+    }
+
+    // Rollup for the Range pane: a fixed-length, time-aligned array of
+    // windowSeconds/granularitySeconds slots (oldest first, last slot = now),
+    // each the average of the rows falling in it, or NaN where there's no
+    // data — so a range with little history is mostly gaps, not stretched. Used for every selectable range —
+    // when granularitySeconds equals the native bucket_samples spacing
+    // (the three shortest ranges), each row lands in its own group, so
+    // this returns the raw rows unchanged rather than actually coarsening
+    // them.
+    func rollup(granularitySeconds: Int64, windowSeconds: Int64, now: Int64) -> [Double] {
+        let slotCount = Int(windowSeconds / granularitySeconds)
+        var result = [Double](repeating: .nan, count: slotCount)
+        guard let db else { return result }
+        let start = now - windowSeconds
+        let sql = """
+            SELECT (timestamp - ?) / ? AS slot, AVG(temperature) FROM bucket_samples
+            WHERE timestamp >= ?
+            GROUP BY slot;
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return result }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, start)
+        sqlite3_bind_int64(stmt, 2, granularitySeconds)
+        sqlite3_bind_int64(stmt, 3, start)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let slot = Int(sqlite3_column_int64(stmt, 0))
+            if slot >= 0 && slot < slotCount {
+                result[slot] = sqlite3_column_double(stmt, 1)
+            } else if slot >= slotCount {
+                result[slotCount - 1] = sqlite3_column_double(stmt, 1)
+            }
+        }
+        return result
     }
 }
 
@@ -50,10 +203,11 @@ final class TemperatureReader: ObservableObject {
     static let shared = TemperatureReader()
 
     @Published var rawHistory: [Double] = []      // last 5 minutes, full resolution
-    @Published var bucketHistory: [Double] = []   // older, 5-minute averages, oldest first
     @Published var current: Double = 0
     @Published var maxSeen: Double = 0
     @Published var alertLevel: AlertLevel = .none
+    @Published var rangeHistory: [Double] = []
+    @Published private(set) var selectedRange: RangeSpec.Range = .hours24
 
     // Notified on every sample so the menu bar icon can redraw itself.
     var onSample: ((Double, [Double]) -> Void)?
@@ -76,10 +230,27 @@ final class TemperatureReader: ObservableObject {
     func start() {
         guard timer == nil else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        // Hydrate from the durable store so the Range pane doesn't come up
+        // empty after a restart.
+        refreshRangeHistory()
         readOnce()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.readOnce()
         }
+    }
+
+    // Called on launch and whenever the UI picks a different range.
+    func setRange(_ range: RangeSpec.Range) {
+        selectedRange = range
+        refreshRangeHistory()
+    }
+
+    private func refreshRangeHistory() {
+        rangeHistory = HistoryStore.shared.rollup(
+            granularitySeconds: selectedRange.granularitySeconds,
+            windowSeconds: selectedRange.windowSeconds,
+            now: Int64(Date().timeIntervalSince1970)
+        )
     }
 
     private func readOnce() {
@@ -98,12 +269,17 @@ final class TemperatureReader: ObservableObject {
                 self.bucketSum += evicted
                 self.bucketCount += 1
                 if self.bucketCount >= Int(HistorySpec.bucketSeconds) {
-                    self.bucketHistory.append(self.bucketSum / HistorySpec.bucketSeconds)
-                    if self.bucketHistory.count > HistorySpec.bucketCapacity {
-                        self.bucketHistory.removeFirst()
-                    }
+                    let bucketAverage = self.bucketSum / HistorySpec.bucketSeconds
                     self.bucketSum = 0
                     self.bucketCount = 0
+
+                    // Durable write + retention pruning + Range pane refresh.
+                    // Only runs once per 5 minutes, so doing this
+                    // synchronously on the main thread is fine.
+                    let now = Int64(Date().timeIntervalSince1970)
+                    HistoryStore.shared.insertBucket(timestamp: now, temperature: bucketAverage)
+                    HistoryStore.shared.pruneOlderThan(now - RangeSpec.retentionSeconds)
+                    self.refreshRangeHistory()
                 }
             }
 
@@ -308,8 +484,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 // MARK: - Chart
 
 struct TemperatureChart: View {
-    let values: [Double]
+    let values: [Double]   // NaN = no data for that slot
     var emptyMessage: String? = nil
+    static let leftInset: CGFloat = 30   // room for y-axis labels
 
     private func y(for value: Double, height: CGFloat) -> CGFloat {
         let clamped = min(max(value, ThermalSpec.chartFloor), ThermalSpec.chartCeiling)
@@ -323,23 +500,42 @@ struct TemperatureChart: View {
         return .green
     }
 
+    // Y-axis gridlines every 20% of the chart's floor-to-ceiling range,
+    // each labeled — deliberately coarse rather than every-10-degree.
+    private let yAxisFractions: [Double] = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+    private func value(atFraction fraction: Double) -> Double {
+        ThermalSpec.chartFloor + fraction * (ThermalSpec.chartCeiling - ThermalSpec.chartFloor)
+    }
+
     var body: some View {
         GeometryReader { geo in
-            let width = geo.size.width
+            let width = geo.size.width - Self.leftInset
             let height = geo.size.height
 
-            ZStack {
-                // Grid lines every 10 degrees
+            ZStack(alignment: .topLeading) {
                 Path { path in
-                    var t = ThermalSpec.chartFloor
-                    while t <= ThermalSpec.chartCeiling {
-                        let py = y(for: t, height: height)
+                    for fraction in yAxisFractions {
+                        let py = y(for: value(atFraction: fraction), height: height)
                         path.move(to: CGPoint(x: 0, y: py))
                         path.addLine(to: CGPoint(x: width, y: py))
-                        t += 10
                     }
                 }
                 .stroke(Color.gray.opacity(0.15), lineWidth: 1)
+                .offset(x: Self.leftInset)
+
+                ForEach(yAxisFractions, id: \.self) { fraction in
+                    let py = y(for: value(atFraction: fraction), height: height)
+                    // .position() places in absolute chart coordinates (unlike
+                    // .offset(), which is relative to this ZStack's own
+                    // center-aligned layout position) — clamped a few points
+                    // in from the top/bottom edge so labels at 30°/105° don't
+                    // spill outside the plot area.
+                    Text("\(Int(value(atFraction: fraction)))°")
+                        .font(.system(size: 8))
+                        .foregroundColor(.secondary)
+                        .position(x: Self.leftInset / 2, y: min(max(py, 5), height - 5))
+                }
 
                 // Vertical gridlines at the same time fractions as the x-axis labels below
                 Path { path in
@@ -350,30 +546,52 @@ struct TemperatureChart: View {
                     }
                 }
                 .stroke(Color.gray.opacity(0.15), lineWidth: 1)
+                .offset(x: Self.leftInset)
 
                 // Yellow threshold (85%)
                 thresholdLine(value: ThermalSpec.yellow, color: .yellow, width: width, height: height)
+                    .offset(x: Self.leftInset)
                 // Red threshold (95%)
                 thresholdLine(value: ThermalSpec.red, color: .red, width: width, height: height)
+                    .offset(x: Self.leftInset)
 
-                // Temperature line, colored by current severity
-                if values.count > 1 {
+                // Temperature line, colored by latest real value. NaN entries are
+                // skipped, so the line interpolates straight across gaps between
+                // real values; leading/trailing gaps stay blank (no extrapolation
+                // past the first/last real sample). Real values also get a dot.
+                if values.contains(where: { !$0.isNaN }) {
+                    let color = lineColor(for: values.last(where: { !$0.isNaN }) ?? 0)
+                    let stepX = width / CGFloat(max(values.count - 1, 1))
                     Path { path in
-                        let stepX = width / CGFloat(max(values.count - 1, 1))
-                        for (index, value) in values.enumerated() {
+                        var started = false
+                        for (index, value) in values.enumerated() where !value.isNaN {
                             let point = CGPoint(x: CGFloat(index) * stepX, y: y(for: value, height: height))
-                            if index == 0 {
-                                path.move(to: point)
+                            if started {
+                                path.addLine(to: point)   // bridges interior gaps with a straight line
                             } else {
-                                path.addLine(to: point)
+                                path.move(to: point)
+                                started = true
                             }
                         }
                     }
-                    .stroke(lineColor(for: values.last ?? 0), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    .offset(x: Self.leftInset)
+
+                    if values.count <= 400 {
+                        Path { path in
+                            for (index, value) in values.enumerated() where !value.isNaN {
+                                let p = CGPoint(x: CGFloat(index) * stepX, y: y(for: value, height: height))
+                                path.addEllipse(in: CGRect(x: p.x - 1.5, y: p.y - 1.5, width: 3, height: 3))
+                            }
+                        }
+                        .fill(color)
+                        .offset(x: Self.leftInset)
+                    }
                 } else if let message = emptyMessage {
                     Text(message)
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                        .frame(width: geo.size.width, height: height)
                 }
             }
         }
@@ -409,7 +627,8 @@ struct TimeAxisLabels: View {
         if ageSeconds <= 0 { return "now" }
         if ageSeconds < 60 { return "-\(ageSeconds)s" }
         if ageSeconds < 3600 { return "-\(ageSeconds / 60)m" }
-        return String(format: "-%.1fh", Double(ageSeconds) / 3600.0)
+        if ageSeconds < 2 * 86400 { return String(format: "-%.1fh", Double(ageSeconds) / 3600.0) }
+        return "-\(Int((Double(ageSeconds) / 86400.0).rounded()))d"
     }
 
     var body: some View {
@@ -421,6 +640,7 @@ struct TimeAxisLabels: View {
         }
         .font(.system(size: 9))
         .foregroundColor(.secondary)
+        .padding(.leading, TemperatureChart.leftInset)
     }
 }
 
@@ -435,21 +655,26 @@ struct ContentView: View {
         return .green
     }
 
-    private var historyAverage: Double {
-        guard !reader.bucketHistory.isEmpty else { return 0 }
-        return reader.bucketHistory.reduce(0, +) / Double(reader.bucketHistory.count)
+    // Live pane always spans the full 5 minutes; unfilled slots on the left are gaps.
+    private var livePadded: [Double] {
+        let pad = max(HistorySpec.rawCapacitySeconds - reader.rawHistory.count, 0)
+        return [Double](repeating: .nan, count: pad) + reader.rawHistory
     }
 
-    private var historyColor: Color {
-        if historyAverage >= ThermalSpec.red { return .red }
-        if historyAverage >= ThermalSpec.yellow { return .yellow }
+    private var rangeAverage: Double {
+        let real = reader.rangeHistory.filter { !$0.isNaN }
+        guard !real.isEmpty else { return 0 }
+        return real.reduce(0, +) / Double(real.count)
+    }
+
+    private var rangeColor: Color {
+        if rangeAverage >= ThermalSpec.red { return .red }
+        if rangeAverage >= ThermalSpec.yellow { return .yellow }
         return .green
     }
 
-    private var historyLabel: String {
-        let hours = HistorySpec.totalHours
-        let hoursText = hours.truncatingRemainder(dividingBy: 1) == 0 ? String(Int(hours)) : String(format: "%.1f", hours)
-        return "History — last \(hoursText)h, 5-min avg"
+    private var rangeLabel: String {
+        "Range — last \(reader.selectedRange.rawValue.lowercased()), \(reader.selectedRange.granularityLabel)"
     }
 
     var body: some View {
@@ -475,26 +700,37 @@ struct ContentView: View {
             .padding([.top, .horizontal])
 
             paneLabel("Live — last 5 min")
-            TemperatureChart(values: reader.rawHistory)
+            TemperatureChart(values: livePadded)
                 .frame(height: 110)
                 .padding(.horizontal)
-            TimeAxisLabels(totalSeconds: Double(reader.rawHistory.count))
+            TimeAxisLabels(totalSeconds: Double(HistorySpec.rawCapacitySeconds))
                 .padding(.horizontal)
 
+            Picker("Range", selection: Binding(
+                get: { reader.selectedRange },
+                set: { reader.setRange($0) }
+            )) {
+                ForEach(RangeSpec.Range.allCases) { range in
+                    Text(range.rawValue).tag(range)
+                }
+            }
+            .pickerStyle(.menu)
+            .padding(.horizontal)
+
             HStack {
-                Text(historyLabel)
+                Text(rangeLabel)
                     .foregroundColor(.secondary)
                 Spacer()
-                Text(historyAverage > 0 ? String(format: "avg %.1f°C", historyAverage) : "avg —")
-                    .foregroundColor(historyColor)
+                Text(rangeAverage > 0 ? String(format: "avg %.1f°C", rangeAverage) : "avg —")
+                    .foregroundColor(rangeColor)
             }
             .font(.caption.bold())
             .padding(.horizontal)
 
-            TemperatureChart(values: reader.bucketHistory, emptyMessage: "Collecting data — first 5-min average lands soon")
+            TemperatureChart(values: reader.rangeHistory, emptyMessage: "Collecting data for this range")
                 .frame(height: 110)
                 .padding(.horizontal)
-            TimeAxisLabels(totalSeconds: Double(reader.bucketHistory.count) * HistorySpec.bucketSeconds)
+            TimeAxisLabels(totalSeconds: Double(reader.selectedRange.windowSeconds))
                 .padding(.horizontal)
                 .padding(.bottom)
 
@@ -512,7 +748,7 @@ struct ContentView: View {
             .padding([.horizontal, .bottom])
             .font(.caption2)
         }
-        .frame(minWidth: 320, idealWidth: 420, minHeight: 480, idealHeight: 600)
+        .frame(minWidth: 320, idealWidth: 420, minHeight: 520, idealHeight: 640)
         .background(WindowAccessor { window in
             AppDelegate.shared.attach(window: window)
         })

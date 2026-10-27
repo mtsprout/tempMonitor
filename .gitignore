@@ -2,3 +2,5 @@ TempMonitor
 TempMonitor.app/
 *.dSYM/
 .DS_Store
+AppIcon.png
+AppIcon.iconset/
