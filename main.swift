@@ -6,10 +6,10 @@ import SQLite3
 
 // MARK: - Thermal spec
 //
-// This Mac is an iMac20,2 (27", 2020) with an 8-core Intel Core i7-10700K.
-// Intel lists Tjunction max (the point at which the CPU throttles/shuts
-// down to protect itself) at 100C for this chip.
-// Source: https://www.intel.com/content/www/us/en/products/sku/199335/intel-core-i710700k-processor-16m-cache-up-to-5-10-ghz/specifications.html
+// Targets Apple Silicon Macs. Apple doesn't publish a Tjunction max, so
+// tjMax is a reference ceiling (~100C die temperature, where these chips
+// begin to throttle) rather than a datasheet value. The yellow/red lines
+// are 85% / 95% of it.
 enum ThermalSpec {
     static let tjMax: Double = 100.0
     static let yellow: Double = tjMax * 0.85 // 85.0
@@ -213,7 +213,6 @@ final class TemperatureReader: ObservableObject {
     var onSample: ((Double, [Double]) -> Void)?
 
     private var timer: Timer?
-    private let toolPath = "/usr/local/bin/osx-cpu-temp"
 
     // Accumulates raw samples evicted from rawHistory until there are
     // enough (5 minutes' worth) to consolidate into one bucket average.
@@ -254,7 +253,7 @@ final class TemperatureReader: ObservableObject {
     }
 
     private func readOnce() {
-        guard let value = Self.readTemperature(toolPath: toolPath) else { return }
+        guard let value = Self.readTemperature() else { return }
         DispatchQueue.main.async {
             self.current = value
             self.maxSeen = max(self.maxSeen, value)
@@ -331,26 +330,69 @@ final class TemperatureReader: ObservableObject {
         NSSound(named: "Sosumi")?.play()
     }
 
-    private static func readTemperature(toolPath: String) -> Double? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: toolPath)
-        process.arguments = ["-c"]
+    // Reads the Apple Silicon die temperature in-process via the private
+    // IOHIDEventSystemClient API (no sudo, no external tools). Returns the
+    // hottest "tdie" PMU sensor, which tracks the hottest CPU/SoC region.
+    // The symbols are resolved with dlsym since they aren't in public headers.
+    private static func readTemperature() -> Double? {
+        guard let client = HIDThermal.shared else { return nil }
+        return client.maxDieTemperature()
+    }
+}
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+// MARK: - HID thermal sensors (Apple Silicon)
 
-        do {
-            try process.run()
-        } catch {
-            return nil
+final class HIDThermal {
+    static let shared: HIDThermal? = HIDThermal()
+
+    private typealias CreateFn = @convention(c) (CFAllocator?) -> Unmanaged<AnyObject>?
+    private typealias SetMatchFn = @convention(c) (AnyObject, CFDictionary) -> Void
+    private typealias CopyServicesFn = @convention(c) (AnyObject) -> Unmanaged<CFArray>?
+    private typealias CopyPropFn = @convention(c) (AnyObject, CFString) -> Unmanaged<CFTypeRef>?
+    private typealias CopyEventFn = @convention(c) (AnyObject, Int64, Int32, Int64) -> Unmanaged<AnyObject>?
+    private typealias FloatValFn = @convention(c) (AnyObject, Int32) -> Double
+
+    private let client: AnyObject
+    private let copyServices: CopyServicesFn
+    private let copyProp: CopyPropFn
+    private let copyEvent: CopyEventFn
+    private let floatVal: FloatValFn
+
+    private static let temperatureEventType: Int64 = 15  // kIOHIDEventTypeTemperature
+
+    private init?() {
+        guard let h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
+              let create = dlsym(h, "IOHIDEventSystemClientCreate"),
+              let setMatch = dlsym(h, "IOHIDEventSystemClientSetMatching"),
+              let copyServices = dlsym(h, "IOHIDEventSystemClientCopyServices"),
+              let copyProp = dlsym(h, "IOHIDServiceClientCopyProperty"),
+              let copyEvent = dlsym(h, "IOHIDServiceClientCopyEvent"),
+              let floatVal = dlsym(h, "IOHIDEventGetFloatValue"),
+              let client = unsafeBitCast(create, to: CreateFn.self)(kCFAllocatorDefault)?.takeRetainedValue()
+        else { return nil }
+        // Vendor-defined usage page 0xff00, usage 5 = temperature sensors.
+        unsafeBitCast(setMatch, to: SetMatchFn.self)(
+            client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        self.client = client
+        self.copyServices = unsafeBitCast(copyServices, to: CopyServicesFn.self)
+        self.copyProp = unsafeBitCast(copyProp, to: CopyPropFn.self)
+        self.copyEvent = unsafeBitCast(copyEvent, to: CopyEventFn.self)
+        self.floatVal = unsafeBitCast(floatVal, to: FloatValFn.self)
+    }
+
+    func maxDieTemperature() -> Double? {
+        guard let services = copyServices(client)?.takeRetainedValue() as [AnyObject]? else { return nil }
+        var hottest: Double?
+        for service in services {
+            let name = copyProp(service, "Product" as CFString)?.takeRetainedValue() as? String ?? ""
+            guard name.contains("tdie") else { continue }
+            guard let event = copyEvent(service, Self.temperatureEventType, 0, 0)?.takeRetainedValue() else { continue }
+            let value = floatVal(event, Int32(Self.temperatureEventType << 16))
+            // Ignore implausible readings (sensor glitches / sentinel values).
+            guard value > 0, value < 150 else { continue }
+            hottest = max(hottest ?? value, value)
         }
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return nil }
-        let digitsAndDot = output.filter { $0.isNumber || $0 == "." }
-        return Double(digitsAndDot)
+        return hottest
     }
 }
 
@@ -808,7 +850,7 @@ struct TempMonitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup("iMac Temperature") {
+        WindowGroup("CPU Temperature") {
             ContentView()
         }
         .windowResizability(.contentSize)

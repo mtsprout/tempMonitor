@@ -16,19 +16,13 @@ A small native macOS app that graphs CPU temperature live, like Activity Monitor
 
 ## Why 85°C / 95°C
 
-This app was built for an iMac20,2 (27", 2020) with an 8-core Intel Core i7-10700K. Intel's spec lists that chip's Tjunction max — the point at which it throttles or shuts down to protect itself — at **100°C** ([Intel ARK](https://www.intel.com/content/www/us/en/products/sku/199335/intel-core-i710700k-processor-16m-cache-up-to-5-10-ghz/specifications.html)). The thresholds are 85% and 95% of that ceiling. If you run this on different hardware, update `ThermalSpec.tjMax` in `main.swift` to match your CPU's Tjunction max.
+This is the Apple Silicon port (the `apple-silicon` branch). Apple doesn't publish a Tjunction max for its chips, so `ThermalSpec.tjMax` is a reference ceiling of **100°C** (roughly where these chips begin to throttle), and the thresholds are 85% and 95% of it. Adjust `ThermalSpec.tjMax` in `main.swift` if you want different lines. The original Intel iMac version lives on `main`.
 
 ## Requirements
 
 - macOS
 - Xcode Command Line Tools (for `swiftc`)
-- [`osx-cpu-temp`](https://github.com/lavoiesl/osx-cpu-temp), installed via Homebrew:
-
-  ```
-  brew install osx-cpu-temp
-  ```
-
-  This reads the SMC temperature sensor directly and doesn't require sudo. The app shells out to `/usr/local/bin/osx-cpu-temp -c` once per second.
+- An Apple Silicon Mac. Temperatures are read in-process from the HID thermal sensors (the hottest `tdie` sensor) through private IOKit APIs — no sudo and no Homebrew tools. Because the API is undocumented, a future macOS release could break it.
 
 ## Build
 
