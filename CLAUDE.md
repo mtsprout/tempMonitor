@@ -44,3 +44,14 @@ Everything lives in `main.swift`, organized by `// MARK:` sections:
 - No dependency manager, no Package.swift — plain `swiftc`. Don't introduce SwiftPM/Xcode project scaffolding unless asked; it's not needed for a single-file app.
 - `AppIcon.icns` is generated, not hand-edited: `make_icon.swift` draws `AppIcon.png` (same tube/bulb approach as `AppDelegate.updateIcon`, just larger and fixed at a 67°C reading) via `swift make_icon.swift`, then `sips`/`iconutil` build the `.icns` — see README's "Regenerating the icon". `AppIcon.png` and `AppIcon.iconset/` are intermediate/gitignored; only `make_icon.swift` (source) and `AppIcon.icns` (compiled result) are tracked. Don't hand-author or edit the `.icns` directly — change `make_icon.swift` and regenerate.
 - The app is installed at `/Applications/TempMonitor.app` (`cp -R TempMonitor.app /Applications/TempMonitor.app`, then `touch` it and `killall Finder Dock` to bust macOS's icon cache if the icon changed) — that's a manual step for the user's own convenience, not part of the normal build/iterate loop above; don't re-run it automatically on every code change.
+
+## Status (as of 2026-11-25)
+
+Feature complete. Nothing is in progress.
+
+- **Branches:** `main` is the Intel iMac20,2 version (reads `osx-cpu-temp`); `apple-silicon` is the port for this Mac (Mac18,5, Apple M6) and is a long-lived branch — intentionally not merged into `main`, since the two sensor paths are incompatible. Both are pushed to `origin` (`git@github.com:mtsprout/tempMonitor.git`). Work on `apple-silicon` for this machine.
+- **Installed:** the `apple-silicon` build (arm64, ad-hoc signed) is at `/Applications/TempMonitor.app`. Reinstall by hand after code changes (see the last convention above).
+- **Verified:** native arm64 process runs without crashing and the user confirmed live readings (steady ~69°C under load; idle die sensors are ~17–27°C). Chart/menu bar rendering was eyeballed by the user, not by automation.
+- **Known risk:** `HIDThermal` uses private IOKit APIs; if readings go blank after a macOS update, start there. `readOnce()` skips nil readings silently, so the symptom is an empty chart rather than an error.
+- **Environment notes:** `gh` is installed and logged in as `mtsprout`. SSH to GitHub works (GitHub host keys were added to `~/.ssh/known_hosts` from `gh api meta`).
+- **Possible future ideas (not started):** surface a visible "no sensor data" state instead of failing silently; make thresholds configurable instead of editing `ThermalSpec`.
